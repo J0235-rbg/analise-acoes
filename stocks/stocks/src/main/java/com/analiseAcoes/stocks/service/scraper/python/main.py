@@ -3,48 +3,85 @@ from fastapi import FastAPI, HTTPException
 import numpy as np
 
 app = FastAPI(
-    title="Fundamentus Scraper API.",
-    description="Microserviço de extração fundamentalista de açoões da B3 usando a biblioteca fundamentus.",
+    title="Fundamentus Scraper API",
+    description="Microsserviço de extração fundamentalista de ações da B3",
     version="1.0.0"
 )
+
+def limpar_float(valor) -> float:
+    """Converte com segurança valores para float, tratando padrões numéricos brasileiros."""
+    if valor is None or (isinstance(valor, float) and np.isnan(valor)):
+        return 0.0
+    try:
+        val_str = str(valor).replace('.', '').replace(',', '.').replace('%', '').strip()
+        val_float = float(val_str)
+        return 0.0 if np.isnan(val_float) or np.isinf(val_float) else val_float
+    except Exception:
+        return 0.0
 
 @app.get("/api/v1/dados-acoes")
 def obter_dados_acoes():
     try:
-        # puxa o DataFrame com os dados das ações negociadas na B3
-        df = fundamentus.get_resultado()
+        # Usa get_resultado_raw() para ignorar o renomeamento interno que causava o KeyError
+        try:
+            df = fundamentus.get_resultado_raw()
+        except Exception:
+            # Fallback direto caso o pacote tenha alguma instabilidade adicional
+            import pandas as pd
+            import requests
+            url = "https://www.fundamentus.com.br/resultado.php"
+            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+            req = requests.get(url, headers=headers, timeout=15)
+            dfs = pd.read_html(req.text, decimal=",", thousands=".")
+            df = dfs[0]
 
-        # Reseta o index para transformar a coluna do ticker('papel') em uma coluna normal
-        df.reset_index()
+        # Garante que o ticker seja uma coluna utilizável
+        df = df.reset_index()
 
-        # Trata de valores nulos / infinitos para não quebrar a conversão para JSON 
-        df.replace([np.inf, -np.inf], np.nan)
-        df = df.fillna(0.0)
-
-        # Mapeia as categorias para o padrão aceito pelo backend Spring Boot
         resultado = []
         for _, row in df.iterrows():
+            # Acessa os campos pela ordem fixa das colunas da tabela do Fundamentus
+            # 0: Papel | 1: Cotação | 2: P/L | 3: P/VP | 4: PSR | 5: Div.Yield
+            # 8: Mrg. Líq | 9: Liq. Corr | 15: ROIC | 16: ROE | 19: Dív.Brut/Patrim
+            ticker = str(row.iloc[0]).strip()
+            if not ticker or ticker.lower() == 'papel':
+                continue
+
+            cotacao = limpar_float(row.iloc[1])
+            pl = limpar_float(row.iloc[2])
+            pvp = limpar_float(row.iloc[3])
+            psr = limpar_float(row.iloc[4])
+            dy = limpar_float(row.iloc[5])
+            mrg_liq = limpar_float(row.iloc[8])
+            liq_corr = limpar_float(row.iloc[9])
+            roic = limpar_float(row.iloc[15])
+            roe = limpar_float(row.iloc[16])
+            divida = limpar_float(row.iloc[19]) if len(row) > 19 else 0.0
+
+            # Normaliza valores percentuais caso já venham como fração decimal
+            def ajustar_pct(val):
+                return val * 100 if (0.0 < abs(val) < 1.0) else val
+
             item = {
-                "ticker": str(row.get("papel", "")).strip(),
-                "cotacao": float(row.get("cotacao", 0.0)),
-                "pl": float(row.get("pl", 0.0)),
-                "pvp": float(row.get("pvp", 0.0)),
-                "psr": float(row.get("psr", 0.0)),
-                "dividendYield": float(row.get("dy", 0.0)) * 100, # Converte para porcentagem
-                "roic": float(row.get("roic", 0.0)) * 100, # Converte para porcentagem
-                "roe": float(row.get("roe", 0.0)) * 100, #converte para porcentagem
-                "margemLiquida": float(row.get("mrgLiq", 0.0)) * 100, # Converte para porcentagem
-                "LiquidezCorrente": float(row.get("liq_corr", 0.0)),
-                "dividaLiquidaEbitda": float(row.get("divb_patr", 0.0)) # ou alavancagem equivalente
+                "ticker": ticker,
+                "cotacao": cotacao,
+                "pl": pl,
+                "pvp": pvp,
+                "psr": psr,
+                "dividendYield": ajustar_pct(dy),
+                "roic": ajustar_pct(roic),
+                "roe": ajustar_pct(roe),
+                "margemLiquida": ajustar_pct(mrg_liq),
+                "liquidezCorrente": liq_corr,
+                "dividaLiquidaEbitda": divida
             }
             resultado.append(item)
 
-            return {
-                "status": "sucesso",
-                "total_acoes": len(resultado),
-                "dados": resultado
-            }
+        return {
+            "status": "sucesso",
+            "total_acoes": len(resultado),
+            "dados": resultado
+        }
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro ao obter dados das ações: {str(e)}")
-
-# Execução local: uvicorn main: app --reload --port 8080
